@@ -9,6 +9,28 @@ in
 
 then project still is able to compile, unfortunately i.MXRT1050 eval board does not start.
 
+Most likely the issue refers to code:
+
+`BOARD_InitI2C1Pins();`
+
+in
+
+`source\main.cpp`
+
+as both pieces of code:
+
+`I2C i2c(I2C_SDA, I2C_SCL);`
+
+and
+
+`BOARD_InitI2C1Pins();`
+
+refer to signals
+`GPIO_AD_B1_00` and `GPIO_AD_B1_01`
+
+So I believe this is the point which causes problems.
+Any hints how to sort it out?
+
 # What is the goal
 I want to connect Melexis MLX90640 sensor to Arduino connector and be able to read sensor memory through I2C
 
