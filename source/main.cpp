@@ -48,13 +48,25 @@ extern "C" {
 /*******************************************************************************
  * Definitions
  ******************************************************************************/
-#define MLX90640_ADDRESS (0x33) //slave device address (MLX90640 32x24 IR array)
-#define IMAGE_OFFSET_Y 32 //free space under the top edge of the display reserved for labels
+#define MLX90640_ADDRESS (0x33) //Slave device address (MLX90640 32x24 IR array)
+#define IMAGE_OFFSET_Y 32 //Free space under the top edge of the display reserved for labels,
+                          //MLX90640 is 32x24, STM32F746G-DISCO display is 480x272, active area set to 480x240 (32 pixels at the top for labels)
+#define IMAGE_HEIGHT 240
+#define IMAGE_SCALE_X 10
+#define IMAGE_SCALE_Y 10
+#define TEMP_MIN 21.0
+#define TEMP_MAX 35.0
 
 /*******************************************************************************
  * Variables
  ******************************************************************************/
-Serial pc(USBTX, USBRX, 115200);
+static uint16_t eeMLX90640[832]; //Read all EEPROM data from MLX90640 into a MCU memory location defined by user
+static uint16_t mlx90640Frame[834]; //Get all RAM data from MLX90640 into a MCU memory location defined by user
+paramsMLX90640 mlx90640; //Variable of type paramsMLX90640 to store extracted parameters from EEPROM
+static float mlx90640To[768]; //The calculated object temperatures table
+float emissivity = 1; //The emissivity is a property of the measured object
+float eTa; //Reflected temperature defined by the user (here the ambient temperature could be used from MLX90640_GetTa() function)
+uint8_t ir, ig, ib; //Values to compose pixel color
 
 /*******************************************************************************
  * Prototypes
@@ -62,8 +74,92 @@ Serial pc(USBTX, USBRX, 115200);
 void BOARD_EnableLcdInterrupt(void);
 
 /*******************************************************************************
+ * Objects
+ ******************************************************************************/
+Serial pc(USBTX, USBRX, 115200); //UART, 115200 bauds, 8-bit data, no parity
+
+/*******************************************************************************
  * Code
  ******************************************************************************/
+void compute_false_colour(double v, uint8_t *ir, uint8_t *ig, uint8_t *ib) {
+    const int NUM_COLORS = 7;
+    static float color[NUM_COLORS][3] = { {0,0,0}, {0,0,1}, {0,1,0}, {1,1,0}, {1,0,0}, {1,0,1}, {1,1,1} };
+    int idx1, idx2;
+    float fractBetween = 0;
+    
+    float vmin = TEMP_MIN;
+    float vmax = TEMP_MAX;
+        
+    float vrange = vmax-vmin;
+    v -= vmin;
+    v /= vrange;
+    if(v <= 0) {idx1=idx2=0;}
+    else if(v >= 1) {idx1=idx2=NUM_COLORS-1;}
+    else
+    {
+        v *= (NUM_COLORS-1);
+        idx1 = floor(v);
+        idx2 = idx1+1;
+        fractBetween = v - float(idx1);
+    }
+
+    *ir = (uint8_t)((((color[idx2][0] - color[idx1][0]) * fractBetween) + color[idx1][0]) * 255.0);
+    *ig = (uint8_t)((((color[idx2][1] - color[idx1][1]) * fractBetween) + color[idx1][1]) * 255.0);
+    *ib = (uint8_t)((((color[idx2][2] - color[idx1][2]) * fractBetween) + color[idx1][2]) * 255.0);
+}
+
+void fb_put_pixel(uint16_t x, uint16_t y, uint8_t ir, uint8_t ig, uint8_t ib)
+{
+	uint32_t color;
+
+	color = 0x00 << 24;
+	color |= ib << 16;
+	color |= ig << 8;
+	color |= ir;
+
+	GUI_SetColor(color);
+	GUI_DrawPixel(x, y);
+}
+
+void fb_put_rect(uint16_t x, uint16_t y, uint8_t ir, uint8_t ig, uint8_t ib)
+{
+	uint32_t color;
+
+	color = 0x00 << 24;
+	color |= ib << 16;
+	color |= ig << 8;
+	color |= ir;
+
+	GUI_SetColor(color);
+	GUI_FillRect(x, y, x + IMAGE_SCALE_X, y + IMAGE_SCALE_Y);
+}
+
+void draw_color_scale()
+{
+    GUI_SetColor(GUI_BLACK);
+	GUI_DrawRect(400, IMAGE_OFFSET_Y - 16, 400+79, 255); //To draw a frame for color scale
+    
+    int temp_legend_max = TEMP_MAX, temp_legend_min = TEMP_MIN;
+	char print_buf_legend_min[4], print_buf_legend_max[4];
+
+    float delta = (TEMP_MAX - TEMP_MIN) / IMAGE_HEIGHT;
+
+    for (int y = 0; y < IMAGE_HEIGHT - 2; y++) {
+		for (int x = 0; x < 80 - 2; x++) {
+			float temp = (y * delta) + TEMP_MIN;
+			compute_false_colour(temp, &ir, &ig, &ib);
+			fb_put_pixel(x + 400 + 1, IMAGE_HEIGHT - y + 14, ir, ig, ib); //Calculations to put color scale inside the frame for color scale
+		}
+	}
+
+    sprintf(print_buf_legend_min, "%2dC", temp_legend_min);
+	GUI_SetColor(GUI_BLUE);
+	GUI_DispStringAt(print_buf_legend_min, 360, 245);
+
+	sprintf(print_buf_legend_max, "%2dC", temp_legend_max);
+	GUI_DispStringAt(print_buf_legend_max, 360, 5);
+}
+
 /*!
  * @brief Main function
  */
@@ -75,13 +171,13 @@ int main(void)
     BOARD_InitLcdifPixelClock();
     BOARD_InitLcd();
     
-    pc.printf("GUI demo start.\r\n");
+    pc.printf("GUI demo start.\n\r");
 
     GUI_Init();
     
-    /* Intro screen */
+    /*Intro screen*/
     GUI_SetBkColor(GUI_WHITE);
-    GUI_Clear(); //fills the display/the active window with the background color
+    GUI_Clear(); //Fills the display/the active window with the background color
     GUI_SetBkColor(GUI_GREEN);
     GUI_SetColor(GUI_WHITE);
     GUI_SetFont(&GUI_Font32B_ASCII);
@@ -89,141 +185,90 @@ int main(void)
     GUI_X_Delay(10000);
     GUI_DispStringHCenterAt("MELEXIS MLX90640" , 240, 110);
     GUI_X_Delay(10000);
-    GUI_DispStringHCenterAt("FE" , 240, 165);
+    GUI_DispStringHCenterAt("FUTURE ELECTRONICS" , 240, 165);
     GUI_X_Delay(20000);
     
     GUI_SetBkColor(GUI_WHITE);
-    GUI_Clear(); //fills the display/the active window with the background color
+    GUI_Clear(); //Fills the display/the active window with the background color
     GUI_SetFont(&GUI_Font24_ASCII);
     GUI_SetColor(GUI_BLUE);
-    GUI_DispStringAt("THERMAL IMAGER", 60, 5);
+    GUI_DispStringAt("SEQUANA THERMAL", 60, 5);
 
-    pc.printf("Ready to go after Intro screen displayed\n\r");
-    
-    pc.printf("Time to dump EEPROM\n\r");
+    draw_color_scale();
 
-/* 
- * DUMPING EEPROM section
- * 
- * We need to read all EEPROM data from MLX90640 into a MCU memory location defined by user.
- * Next, we need to extract the parameters from a given EEPROM data array and store values as type defined in MLX90640_API.h
- * It means workflow is as follows:
- * 
- * static uint16_t eeMLX90640[832]; //to store EEPROM data
- * paramsMLX90640 mlx90640; //variable of type paramsMLX90640 to store extracted parameters from EEPROM
- * MLX90640_DumpEE(MLX90640_ADDRESS, eeMLX90640);
- * MLX90640_ExtractParameters(eeMLX90640, &mlx90640);
- * 
- * As you do not have your own MLX90640 sensor, I have prepared EEPROM data so and no communication to sensor is needed.
- * I just read EEPROM of my sensor and copied the data to below table.
- */
-    static uint16_t eeMLX90640[832] = {
-                    0x00a9,  0x599b,  0x0000,  0x2061,  0x0004,  0x0320,  0x03e0,  0x0c18,
-                    0xa235,  0x0185,  0x048d,  0x0000,  0x1901,  0x0000,  0x0000,  0xbe33,
-                    0x4210,  0xffb4,  0x1213,  0x0212,  0xf202,  0xe1f1,  0xd0e1,  0x9fc0,
-                    0x1234,  0x0124,  0xe003,  0xd0f2,  0xd0e3,  0xc0d3,  0xc1d4,  0x91d3,
-                    0x79a6,  0x2f73,  0xdca9,  0x10ff,  0x3322,  0x3333,  0x0122,  0xcdff,
-                    0xddcb,  0x00fe,  0x2211,  0x3322,  0x2333,  0x1122,  0xff00,  0xccee,
-                    0x17a0,  0x2fa3,  0x2154,  0xa089,  0x7666,  0x0984,  0x6867,  0x6362,
-                    0x2463,  0x0465,  0x17b5,  0x0646,  0xec00,  0xf300,  0x9ec5,  0x2558,
-                    0x0b62,  0xfef2,  0x1050,  0xf13e,  0xf980,  0xf8a0,  0x1440,  0xf060,
-                    0x0030,  0xf47e,  0x13ce,  0xf7ce,  0x044e,  0xf860,  0x0f70,  0xf37e,
-                    0xfbe0,  0xf7a0,  0x0f5e,  0xe46e,  0xf430,  0xf410,  0x0490,  0xe45e,
-                    0xed00,  0xf0a0,  0x00f0,  0xdcd0,  0xe920,  0xe480,  0x03f2,  0xeb10,
-                    0x1364,  0x0750,  0xf8ce,  0x1130,  0x0152,  0x007e,  0xf81e,  0x0c20,
-                    0x0402,  0xfc4e,  0xffac,  0x13a0,  0x0c22,  0x003e,  0xfb5c,  0x1350,
-                    0x03c2,  0x038e,  0xfb4e,  0x0830,  0xfc10,  0xfffe,  0xf46e,  0x0820,
-                    0xf8d2,  0xfc70,  0xf0be,  0xfca0,  0xf8f2,  0xf490,  0xf08e,  0x0f42,
-                    0x1412,  0x0822,  0x18c0,  0xfcfe,  0x0900,  0x0810,  0x1fe0,  0xfffe,
-                    0x13c0,  0x0bf0,  0x1f9e,  0x038e,  0x0c4e,  0x0440,  0x1b7e,  0xff6e,
-                    0x0bb0,  0xffb0,  0x1b60,  0xf42e,  0x0bd0,  0x03e0,  0x1830,  0xf03e,
-                    0x0490,  0xfc50,  0x1080,  0xf04e,  0xf8b0,  0xf850,  0x1922,  0xf050,
-                    0x0c74,  0xfc4e,  0xf08e,  0x0cc0,  0x00d2,  0x03c0,  0xf7be,  0x0fc0,
-                    0x0b92,  0x03ce,  0xfb6e,  0x1350,  0x0020,  0xfc2e,  0xf75e,  0x0f40,
-                    0xffa0,  0xfb9e,  0xf34c,  0x0400,  0x07b2,  0xffce,  0xf41e,  0x0002,
-                    0xfc62,  0xf820,  0xec5e,  0x0400,  0xf472,  0xf410,  0xf50e,  0x0090,
-                    0x18b2,  0x0430,  0x1c00,  0xfc40,  0x1440,  0x0b80,  0x1f70,  0x035e,
-                    0x0f9e,  0x07a0,  0x1f2e,  0x033e,  0x13fe,  0x07f0,  0x174e,  0xf76e,
-                    0x1360,  0x0350,  0x1720,  0xf7ee,  0x07c0,  0x0790,  0x17e0,  0xfb8e,
-                    0xfc30,  0x03d0,  0x0fe0,  0xf3a0,  0x03e0,  0xfba2,  0x14a2,  0xec70,
-                    0x0902,  0xf470,  0xf03e,  0x0872,  0x0882,  0xfbb0,  0xf3be,  0x0f90,
-                    0x03e0,  0xfbfe,  0xf78e,  0x0b80,  0x0450,  0xf84e,  0xefae,  0x03b0,
-                    0x03b2,  0xfbae,  0xef7e,  0x0040,  0xfc12,  0xfbee,  0xec3e,  0x0bd0,
-                    0xf882,  0xf410,  0xec2e,  0x03e0,  0xf822,  0xf3d0,  0xf0de,  0xfca0,
-                    0x0910,  0x0462,  0x1830,  0xfc7e,  0x0c80,  0x07d0,  0x17ce,  0xfbde,
-                    0x07fe,  0x0030,  0x1bce,  0xffce,  0x088e,  0xfcd0,  0x13fe,  0xf00e,
-                    0x000e,  0x03e0,  0x13be,  0xf05e,  0x0420,  0x0010,  0x1430,  0xf020,
-                    0x0070,  0xfc20,  0x1020,  0xec00,  0xfc30,  0xf7e0,  0x14b2,  0xf080,
-                    0x0cc2,  0xfc00,  0xfbfe,  0x1020,  0x0c32,  0x0380,  0xfb8e,  0x1380,
-                    0x07b0,  0x03fe,  0xfb8e,  0x1380,  0x0840,  0xf89e,  0xf3dc,  0x0bde,
-                    0x07e0,  0x03ae,  0xf78e,  0x0c20,  0x07f2,  0x07e0,  0xfffe,  0x0fd0,
-                    0x0432,  0x03e0,  0xfbde,  0x0bb0,  0x03e2,  0xff90,  0x0060,  0x0c22,
-                    0x0872,  0x07b2,  0x13e0,  0xf430,  0x0420,  0xffa0,  0x177e,  0xfb7e,
-                    0x0790,  0x03c0,  0x1b60,  0xf7be,  0x0070,  0xfc8e,  0x13a0,  0xf7ae,
-                    0xf800,  0xfbc0,  0x136e,  0xec4e,  0xf45e,  0xf810,  0x13f0,  0xf3de,
-                    0xf830,  0xfbe0,  0x0fa0,  0xef80,  0xffa0,  0xf760,  0x1042,  0xeff0,
-                    0x0894,  0xfbd0,  0xec0e,  0x0450,  0x0042,  0xf7c0,  0xf39e,  0x0ba0,
-                    0x03c0,  0xfff0,  0xf79e,  0x0be0,  0xfcb0,  0xf8be,  0xf3de,  0x0bd0,
-                    0xf840,  0xf800,  0xf39e,  0x0470,  0xf492,  0xf830,  0xf42e,  0x0400,
-                    0xfc62,  0xfc0e,  0xf3de,  0x0ba0,  0x03c2,  0xfb80,  0xf46e,  0x0810,
-                    0x0c52,  0x03b2,  0x1770,  0xffc0,  0x0810,  0x0352,  0x1730,  0xfb50,
-                    0x0b90,  0x03c0,  0x0f9e,  0xf3de,  0x009e,  0xf4c0,  0x07be,  0xf3ce,
-                    0x03e0,  0xf7fe,  0x0b90,  0xec5e,  0xfc00,  0xfbf0,  0x0810,  0xf39e,
-                    0xfc00,  0xf400,  0x03b0,  0xeb70,  0xf790,  0xf340,  0x0410,  0xefc0,
-                    0x1462,  0x03c0,  0xff9e,  0x17d2,  0x1034,  0x0760,  0xff5e,  0x1760,
-                    0x13b2,  0x07e0,  0xffbe,  0x0fe0,  0x08c0,  0xfcee,  0xfbee,  0x0fe0,
-                    0x0820,  0x001e,  0xf7ce,  0x0c70,  0x0c22,  0x041e,  0xf84e,  0x1bb0,
-                    0x0c22,  0x0010,  0xfbde,  0x0f90,  0x07b2,  0x0350,  0xfc30,  0x13d0,
-                    0x0c72,  0x0fc2,  0x1bc0,  0x07e0,  0x0820,  0x0f60,  0x1b70,  0xffb0,
-                    0x0fd0,  0x0810,  0x1bee,  0xfc0e,  0x04ae,  0x0100,  0x140e,  0xf80e,
-                    0x0050,  0x0030,  0x13ee,  0xf0de,  0x0050,  0x0830,  0x1080,  0xf810,
-                    0x0440,  0x0800,  0x13e2,  0xfb80,  0x03a0,  0x0360,  0x1832,  0x03b0,
-                    0x0074,  0xf7c0,  0xefde,  0x0fe0,  0x0032,  0xfb70,  0xf38e,  0x0bb2,
-                    0x03e2,  0xf810,  0xefee,  0x0800,  0xfcb0,  0xf500,  0xec0e,  0x0400,
-                    0xf850,  0xf83e,  0xebfe,  0x00e0,  0xfc60,  0x0030,  0xf08e,  0x0c20,
-                    0x0452,  0x000e,  0xf3fe,  0x0f82,  0x03b2,  0xff60,  0xf43e,  0x17c2,
-                    0xfc72,  0x0bd2,  0x13b0,  0xfc00,  0xfc30,  0x0772,  0x1370,  0xfbb0,
-                    0x0792,  0x0be0,  0x17a0,  0xfbbe,  0x0070,  0xfcd0,  0x0fd0,  0xf7ee,
-                    0xfc10,  0x03f0,  0x0bde,  0xecae,  0xfc30,  0x0040,  0x0c50,  0xfbee,
-                    0x0030,  0x07e0,  0x0fb0,  0xf390,  0xff90,  0x0332,  0x1012,  0xfbc0,
-                    0xfc72,  0xfbd0,  0xf3be,  0x0ff2,  0xf832,  0xfb70,  0xf36e,  0x0ba0,
-                    0x0b82,  0x03d0,  0xf79e,  0x13a0,  0x0460,  0xfcb0,  0xf3de,  0x0fd0,
-                    0x0400,  0x03ee,  0xf3ce,  0x0c90,  0x0420,  0x0430,  0xf45e,  0x17d0,
-                    0x0822,  0x0bd0,  0xfbbe,  0x1380,  0x0b92,  0x0b30,  0x0010,  0x1bc2,
-                    0x04a2,  0x0bf2,  0x0800,  0xfc20,  0x0030,  0x0380,  0x0f70,  0xf3b0,
-                    0xffd0,  0x07d0,  0x0f90,  0xf7ee,  0x047e,  0x0080,  0x07ce,  0xf7be,
-                    0x03f0,  0x03f0,  0x0ba0,  0xf060,  0x0012,  0x0400,  0x0c20,  0xf7fe,
-                    0xf842,  0x07f2,  0xfff0,  0xf3b0,  0xfbb0,  0xfb92,  0x0840,  0xf400,
-                    0xfca4,  0xf7e0,  0xe7f0,  0x0412,  0xfc22,  0xf770,  0xeb5e,  0x03a0,
-                    0xffc2,  0xffa0,  0xef7e,  0x03b0,  0x0452,  0xf860,  0xebbe,  0x0b90,
-                    0x03d2,  0xffd0,  0xef8e,  0x0840,  0x07f2,  0x07e0,  0xf41e,  0x13d0,
-                    0x0432,  0xffd0,  0xefee,  0x0b90,  0x03a2,  0xff80,  0xf830,  0x0fe0,
-                    0xf8e2,  0x0c32,  0x0c10,  0x0430,  0xfc60,  0x0bb2,  0x1760,  0xffa0,
-                    0x0b80,  0x0fd0,  0x1780,  0x0380,  0x005e,  0x0c50,  0x1390,  0x0380,
-                    0x03b0,  0x0fa0,  0x0f70,  0xf830,  0x03f0,  0x13b0,  0x1030,  0x03d0,
-                    0xfc32,  0x0fe0,  0x13c2,  0xffa0,  0xffd0,  0x0792,  0x1452,  0x07f0,
-                    0xed42,  0xf090,  0xe070,  0x0892,  0xf4c2,  0xf410,  0xebce,  0x07f0,
-                    0xffe2,  0xfc20,  0xefde,  0x0fd0,  0xf8a0,  0xfc90,  0xefee,  0x0fd0,
-                    0x0002,  0x03e0,  0xefce,  0x0c70,  0x0042,  0x0c00,  0xf08e,  0x1020,
-                    0x0092,  0x0830,  0xf820,  0x1002,  0x0432,  0x07f0,  0xfcc0,  0x1c62,
-                    0xed32,  0x0882,  0x0082,  0xfc90,  0xf4a0,  0x07f2,  0x07d0,  0xf7d0,
-                    0xf7d0,  0x07f0,  0x0f70,  0xff70,  0xf830,  0x0062,  0x07a0,  0xf790,
-                    0xf7e0,  0x03c0,  0x0780,  0xf040,  0xfbf0,  0x0fd0,  0x0c10,  0xfbf0,
-                    0xf462,  0x0810,  0x0422,  0xfbe0,  0xf810,  0x07d2,  0x04e2,  0xfc80,
-                    0xecc2,  0xf050,  0xdc5e,  0x0872,  0xf482,  0xf7c0,  0xe7ae,  0x0ba2,
-                    0xfba2,  0xffb0,  0xef4e,  0x1340,  0x0002,  0xfc20,  0xeb6e,  0x1350,
-                    0xfba0,  0x0380,  0xef4e,  0x0c02,  0x03c2,  0x0f90,  0xfbde,  0x17b0,
-                    0x0432,  0x0fd0,  0xf40e,  0x1bc0,  0x0ff2,  0x0fb0,  0xf8c0,  0x2062,
-                    0xfc32,  0x1042,  0x0c92,  0x00e0,  0x00c0,  0x0c12,  0x0fb0,  0xffd0,
-                    0xffd0,  0x13c2,  0x0b70,  0x0380,  0x0030,  0x1012,  0x0b40,  0x0350,
-                    0x03b0,  0x1750,  0x1330,  0xfc30,  0x03e0,  0x1ba2,  0x1fd2,  0x0bc0,
-                    0xf860,  0x1bf2,  0x0050,  0xfc20,  0xf460,  0x1412,  0x04f0,  0x0860,
-                    0xf7e2,  0xfff2,  0xe8e0,  0x0932,  0xfd12,  0xf860,  0xe81e,  0x0c22,
-                    0xfc12,  0x0400,  0xf3be,  0x0fb0,  0x0472,  0x0450,  0xf78e,  0x1380,
-                    0x03e2,  0x1380,  0xfb7e,  0x1470,  0x0c22,  0x1be0,  0x0820,  0x2412,
-                    0x08b2,  0x1850,  0xf8ae,  0x1480,  0x0cc2,  0x1460,  0x0510,  0x2410};
+    pc.printf("Ready to go!\n\r");
+
+    MLX90640_I2CFreqSet(1000); //I2C Clock = 1MHz
+    MLX90640_SetRefreshRate(MLX90640_ADDRESS, 0x05); //0x05=16Hz
+    //MLX90640_SetChessMode(MLX90640_ADDRESS); //Not needed to setup ChessMode as it comes by default
+
+#if 0
+    /*Checking current refresh rate and working mode (chess or interleaved)*/
+    int curRR;
+    curRR = MLX90640_GetRefreshRate(MLX90640_ADDRESS);
+    pc.printf("Refresh rate is: 0x%02x\n\r", curRR);
     
-    paramsMLX90640 mlx90640;
-    //MLX90640_DumpEE(MLX90640_ADDRESS, eeMLX90640); //this function reads from EEPROM, so I have prepared dumped data in table above
+    int curMODE;
+    curMODE = MLX90640_GetCurMode(MLX90640_ADDRESS);
+    pc.printf("Working mode is (1 for chess pattern, 0 for interleaved): %d\n\r", curMODE);
+#endif
+
+    MLX90640_DumpEE(MLX90640_ADDRESS, eeMLX90640);
+
+#if 0
+    pc.printf("Read EEPROM data is:\n\r");
+    for (uint32_t i = 0U; i < 832; i++)
+    {
+        if (i % 8 == 0)
+        {
+            pc.printf("\r\n");
+        }
+        pc.printf("0x%04x  ", eeMLX90640[i]);
+    }
+    pc.printf("\r\n\r\n");
+#endif
+
     MLX90640_ExtractParameters(eeMLX90640, &mlx90640);
+
+#define NORMAL //Change to TEST for testing case
+#ifdef TEST
+    for(int i = 0; i < 10; i++)
+    {
+        MLX90640_GetFrameData(MLX90640_ADDRESS, mlx90640Frame);
+        eTa = MLX90640_GetTa(mlx90640Frame, &mlx90640);
+        MLX90640_CalculateTo(mlx90640Frame, &mlx90640, emissivity, eTa, mlx90640To); //Calculating the object temperatures for all 768 pixels
+
+        pc.printf("Calculated object temperatures [%d] \n\r ", i);
+        for (uint32_t i = 0U; i < 32; i++)
+    	{
+    		if (i % 16 == 0)
+    		{
+    			pc.printf("\r\n");
+    		}
+    		pc.printf("%.2f  ", mlx90640To[i]);
+    	}
+    	pc.printf("\r\n\r\n");
+    }
+#else
+    while(1){
+        MLX90640_GetFrameData(MLX90640_ADDRESS, mlx90640Frame);
+        eTa = MLX90640_GetTa(mlx90640Frame, &mlx90640);
+        MLX90640_CalculateTo(mlx90640Frame, &mlx90640, emissivity, eTa, mlx90640To); //Calculating the object temperatures for all 768 pixels
+
+        //to consider:
+        //when ambient temperature is being used then shif,t is needed #define TA_SHIFT 8, see the MLX90640 driver datasheet 3.1.14 point 2.
+        
+        for(int y = 0; y < 24 ; y++)
+        {
+            for(int x = 0; x < 32; x++)
+            {
+                float val = mlx90640To[32 * (23 - y) + x];
+                compute_false_colour(val, &ir, &ig, &ib);
+                fb_put_rect(((320 - IMAGE_SCALE_X)-(x*IMAGE_SCALE_X)), (272 - y*IMAGE_SCALE_Y) , ir, ig, ib);
+                //fb_put_rect((x*IMAGE_SCALE_X), (272 - y*IMAGE_SCALE_Y) , ir, ig, ib); //when reference tab looks down (mounted in breadboard)
+    			//fb_put_rect((320 - IMAGE_SCALE_X)-(x*IMAGE_SCALE_X), y*IMAGE_SCALE_Y + IMAGE_OFFSET_Y, ir, ig, ib); //when reference tab looks up (mounted in breadboard)
+            }
+        }
+    }
+#endif
 } //end main
