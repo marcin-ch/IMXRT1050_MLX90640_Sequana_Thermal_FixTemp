@@ -17,7 +17,23 @@
 #include "mbed.h"
 #include "MLX90640_I2C_Driver.h"
 
-I2C i2c(I2C_SDA, I2C_SCL);
+//I2C i2c(I2C_SDA, I2C_SCL);
+/* As there is an issue in \mbed-os\targets\TARGET_NXP\TARGET_MCUXpresso_MCUS\TARGET_MIMXRT1050\TARGET_EVK\PinNames.h
+ * and pin definitions for D14 and D15 are wrong, as follows:
+ * 
+ * D14 = GPIO_AD_B0_01,
+ * D15 = GPIO_AD_B0_00,
+ * I2C_SCL = D15,
+ * I2C_SDA = D14,
+ *
+ * Pin definitions should be:
+ * D14 = GPIO_AD_B1_01,
+ * D15 = GPIO_AD_B1_00,
+ * 
+ * Therefore to not to change mbed-os files directly (PinNames.h is in mbed-os folder) fix the issue locally by:
+ * I2C i2c(GPIO_AD_B1_01, GPIO_AD_B1_00); 
+ */
+I2C i2c(GPIO_AD_B1_01, GPIO_AD_B1_00);
 
 void MLX90640_I2CInit()
 {   
